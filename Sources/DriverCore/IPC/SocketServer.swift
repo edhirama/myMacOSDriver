@@ -1,0 +1,258 @@
+import Foundation
+import DriverProtocol
+
+/// Unix-domain-socket server speaking newline-delimited JSON.
+///
+/// - One JSON object per line in each direction. Responses carry the request `id`, so a client
+///   may pipeline several requests on one connection.
+/// - `{"op":"cancel","id":...}` cancels a running call; `{"op":"status"}` reports host state.
+/// - When a connection closes, its in-flight calls are cancelled (a departed client should not
+///   keep driving the desktop). Completed results stay in the idempotency ledger, so a client
+///   that reconnects and re-sends the same id gets the stored result instead of a second run.
+/// - The socket file is created with mode 0600 inside a 0700 directory: only this user can connect.
+public final class SocketServer: @unchecked Sendable {
+    public let path: String
+    private let driver: Driver
+    private var listenFD: Int32 = -1
+    private var acceptSource: DispatchSourceRead?
+    private let queue = DispatchQueue(label: "dev.macdriver.ipc", attributes: .concurrent)
+    private let connections = Locked<[Int32: Connection]>([:])
+    public var onActivity: (@Sendable (String) -> Void)?
+    /// Enables `test_take_control` / `test_give_back` for automated tests (`--test-ops`).
+    public var testControl: (@Sendable (Bool) -> Void)?
+    /// Test-only mirror input and user actions; returns `{"error": ...}` or a result object.
+    public var testUserInput: (@Sendable ([String: JSONValue]) async -> JSONValue)?
+
+    public init(path: String = DriverProtocol.defaultSocketPath, driver: Driver) {
+        self.path = path; self.driver = driver
+    }
+
+    public enum ServerError: Error, CustomStringConvertible {
+        case pathTooLong, alreadyRunning, posix(String, Int32)
+        public var description: String {
+            switch self {
+            case .pathTooLong: return "Socket path is too long"
+            case .alreadyRunning: return "Another MacDriver host is already serving this socket"
+            case .posix(let op, let e): return "\(op) failed: \(String(cString: strerror(e)))"
+            }
+        }
+    }
+
+    public func start() throws {
+        let dir = (path as NSString).deletingLastPathComponent
+        try FileManager.default.createDirectory(atPath: dir, withIntermediateDirectories: true, attributes: [.posixPermissions: 0o700])
+        // The attributes above apply only when the directory is created; enforce them on an existing one.
+        chmod(dir, 0o700)
+        // A leftover socket file from a crash is removed; a live one means another host is running.
+        if FileManager.default.fileExists(atPath: path) {
+            if Self.canConnect(path) { throw ServerError.alreadyRunning }
+            unlink(path)
+        }
+        let fd = socket(AF_UNIX, SOCK_STREAM, 0)
+        guard fd >= 0 else { throw ServerError.posix("socket", errno) }
+        var addr = try Self.address(path)
+        let len = socklen_t(MemoryLayout<sockaddr_un>.size)
+        let r = withUnsafePointer(to: &addr) { $0.withMemoryRebound(to: sockaddr.self, capacity: 1) { bind(fd, $0, len) } }
+        guard r == 0 else { close(fd); throw ServerError.posix("bind", errno) }
+        chmod(path, 0o600)
+        guard listen(fd, 16) == 0 else { close(fd); throw ServerError.posix("listen", errno) }
+        _ = fcntl(fd, F_SETFL, fcntl(fd, F_GETFL) | O_NONBLOCK)
+        listenFD = fd
+        let src = DispatchSource.makeReadSource(fileDescriptor: fd, queue: queue)
+        src.setEventHandler { [weak self] in self?.acceptPending() }
+        src.resume()
+        acceptSource = src
+        Log.ipc.info("Listening on \(self.path)")
+    }
+
+    public func stop() {
+        acceptSource?.cancel(); acceptSource = nil
+        // Only remove the socket file if this instance bound it; otherwise it may belong to
+        // another running host.
+        let owned = listenFD >= 0
+        if owned { close(listenFD); listenFD = -1 }
+        for c in connections.withLock({ d -> [Connection] in let v = Array(d.values); d.removeAll(); return v }) { c.close() }
+        if owned { unlink(path) }
+    }
+
+    public var connectionCount: Int { connections.get.count }
+
+    private func acceptPending() {
+        while true {
+            let cfd = accept(listenFD, nil, nil)
+            if cfd < 0 { return }
+            // Whoever connects can drive the machine. File permissions already limit the socket
+            // to this user; verifying the peer's user id does not depend on them staying intact.
+            var uid: uid_t = 0, gid: gid_t = 0
+            guard getpeereid(cfd, &uid, &gid) == 0, uid == getuid() else {
+                Log.ipc.error("Refused a connection from another user (uid \(uid))")
+                close(cfd)
+                continue
+            }
+            var on: Int32 = 1
+            setsockopt(cfd, SOL_SOCKET, SO_NOSIGPIPE, &on, socklen_t(MemoryLayout<Int32>.size))
+            let conn = Connection(fd: cfd, server: self)
+            connections.withLock { $0[cfd] = conn }
+            conn.start(queue: queue)
+        }
+    }
+
+    fileprivate func closed(_ c: Connection) {
+        connections.withLock { $0[c.fd] = nil }
+        let ids = c.inFlightIDs
+        if !ids.isEmpty {
+            Task { for id in ids { _ = await driver.cancel(id) } }
+            Log.ipc.info("Client disconnected; cancelled \(ids.count) in-flight call(s)")
+        }
+    }
+
+    fileprivate func handle(line: Data, from c: Connection) {
+        let value: JSONValue
+        do { value = try JSONValue.parse(line) } catch {
+            c.send(errorEnvelope(id: nil, DriverError(.invalidRequest, "Line is not valid JSON")))
+            return
+        }
+        let msg: InboundMessage
+        do { msg = try InboundMessage.parse(value, generateId: { "auto-" + UUID().uuidString.lowercased() }) } catch let e as DriverError {
+            c.send(errorEnvelope(id: value["id"]?.stringValue, e)); return
+        } catch { return }
+
+        switch msg {
+        case .status(let id):
+            Task {
+                var s = await driver.status()
+                if case .object(var o) = s { o["connections"] = .number(Double(connectionCount)); s = .object(o) }
+                c.send(["id": JSONValue(id), "ok": true, "op": "status", "result": s])
+            }
+        case .tools(let id):
+            c.send(["id": JSONValue(id), "ok": true, "op": "tools",
+                    "result": ["protocol_version": .number(Double(DriverProtocol.version)), "tools": .array(driver.toolSpecs.map { $0.json })]])
+        case .testControl(let op):
+            guard let h = testControl else {
+                c.send(errorEnvelope(id: nil, DriverError(.invalidRequest, "Test ops are disabled; launch the host with --test-ops")))
+                return
+            }
+            h(op == "test_take_control")
+            c.send(["ok": true, "op": .string(op), "result": ["control": .string(driver.arbiter.owner.rawValue)]])
+        case .testUserInput(let o):
+            guard let h = testUserInput else {
+                c.send(errorEnvelope(id: nil, DriverError(.invalidRequest, "Test ops are disabled; launch the host with --test-ops")))
+                return
+            }
+            Task {
+                let r = await h(o)
+                if let err = r["error"]?.stringValue { c.send(errorEnvelope(id: nil, DriverError(.invalidArgument, err))) }
+                else { c.send(["ok": true, "op": "test_user_input", "result": r]) }
+            }
+        case .cancel(let id):
+            Task {
+                let found = await driver.cancel(id)
+                c.send(["id": .string(id), "ok": .bool(found), "op": "cancel",
+                        "result": ["cancelled": .bool(found)]])
+            }
+        case .call(let req):
+            c.track(req.id)
+            onActivity?("\(req.name) [\(req.id)]")
+            Task {
+                let resp = await driver.call(req)
+                c.untrack(req.id)
+                c.send(resp.json)
+            }
+        }
+    }
+
+    private func errorEnvelope(id: String?, _ e: DriverError) -> JSONValue {
+        ["id": JSONValue(id), "ok": false, "error": e.json, "dispatch": "none"]
+    }
+
+    static func address(_ path: String) throws -> sockaddr_un {
+        var addr = sockaddr_un()
+        addr.sun_family = sa_family_t(AF_UNIX)
+        let bytes = Array(path.utf8)
+        guard bytes.count < MemoryLayout.size(ofValue: addr.sun_path) else { throw ServerError.pathTooLong }
+        withUnsafeMutableBytes(of: &addr.sun_path) { raw in
+            for (i, b) in bytes.enumerated() { raw[i] = b }
+            raw[bytes.count] = 0
+        }
+        return addr
+    }
+
+    public static func canConnect(_ path: String) -> Bool {
+        let fd = socket(AF_UNIX, SOCK_STREAM, 0)
+        guard fd >= 0, var addr = try? address(path) else { return false }
+        defer { close(fd) }
+        let r = withUnsafePointer(to: &addr) { $0.withMemoryRebound(to: sockaddr.self, capacity: 1) {
+            connect(fd, $0, socklen_t(MemoryLayout<sockaddr_un>.size)) } }
+        return r == 0
+    }
+}
+
+/// One client connection: buffered line reader and serialized writer.
+final class Connection: @unchecked Sendable {
+    let fd: Int32
+    private weak var server: SocketServer?
+    private var source: DispatchSourceRead?
+    private var buffer = Data()
+    private let writeLock = NSLock()
+    private let ids = Locked<Set<String>>([])
+    private var isClosed = false
+    static let maxLine = 4 * 1024 * 1024
+
+    init(fd: Int32, server: SocketServer) { self.fd = fd; self.server = server }
+
+    var inFlightIDs: [String] { Array(ids.get) }
+    func track(_ id: String) { ids.withLock { _ = $0.insert(id) } }
+    func untrack(_ id: String) { ids.withLock { _ = $0.remove(id) } }
+
+    func start(queue: DispatchQueue) {
+        let serial = DispatchQueue(label: "dev.macdriver.conn.\(fd)", target: queue)
+        let src = DispatchSource.makeReadSource(fileDescriptor: fd, queue: serial)
+        src.setEventHandler { [weak self] in self?.readAvailable() }
+        src.setCancelHandler { [fd] in Darwin.close(fd) }
+        source = src
+        src.resume()
+    }
+
+    private func readAvailable() {
+        var chunk = [UInt8](repeating: 0, count: 65536)
+        let n = read(fd, &chunk, chunk.count)
+        if n <= 0 { close(); return }
+        buffer.append(contentsOf: chunk[0..<n])
+        while let nl = buffer.firstIndex(of: 0x0A) {
+            let line = buffer.subdata(in: buffer.startIndex..<nl)
+            buffer.removeSubrange(buffer.startIndex...nl)
+            if !line.allSatisfy({ $0 == 0x20 || $0 == 0x0D || $0 == 0x09 }) { server?.handle(line: line, from: self) }
+        }
+        if buffer.count > Self.maxLine {
+            send(["ok": false, "error": DriverError(.invalidRequest, "Request line exceeds 4 MB").json])
+            close()
+        }
+    }
+
+    func send(_ v: JSONValue) {
+        guard var data = try? v.jsonData() else { return }
+        data.append(0x0A)
+        writeLock.lock(); defer { writeLock.unlock() }
+        if isClosed { return }
+        data.withUnsafeBytes { raw in
+            var off = 0
+            while off < raw.count {
+                let w = write(fd, raw.baseAddress!.advanced(by: off), raw.count - off)
+                if w < 0 {
+                    if errno == EAGAIN || errno == EINTR { usleep(1000); continue }
+                    return
+                }
+                off += w
+            }
+        }
+    }
+
+    func close() {
+        writeLock.lock()
+        if isClosed { writeLock.unlock(); return }
+        isClosed = true
+        writeLock.unlock()
+        source?.cancel()
+        server?.closed(self)
+    }
+}
