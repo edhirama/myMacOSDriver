@@ -45,7 +45,8 @@ public struct Driver: Sendable {
         for attempt in 0...max(0, retries) {
             do { return try roundTrip(.object(req), wait: wait) }
             catch let e as DriverConnectionError {
-                // Running out of time is not retried: closing the connection already cancelled the call.
+                // Running out of time is not retried. The host cancels the call about 2 s after this
+                // connection closes, unless a retry with the same id attaches first.
                 guard e.retryable else { throw e }
                 last = e
                 Thread.sleep(forTimeInterval: 0.2 * Double(attempt + 1))  // same id: never runs twice

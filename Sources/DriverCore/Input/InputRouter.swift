@@ -41,7 +41,8 @@ public final class InputRouter: Sendable {
         case events
     }
 
-    /// What the caller wants to happen around each step. The defaults do nothing.
+    /// What the caller wants to happen around each step. The defaults do nothing, except
+    /// `owner`, which every caller must name.
     public struct Hooks: Sendable {
         /// Called before every piece of input; may suspend (takeover) or throw (cancelled).
         public var gate: @Sendable () async throws -> Void = {}
@@ -49,8 +50,11 @@ public final class InputRouter: Sendable {
         public var evidence: @Sendable (String) -> Void = { _ in }
         public var confirm: @Sendable (String) -> Void = { _ in }
         public var warn: @Sendable (String) -> Void = { _ in }
-        public init() {}
-        public static let none = Hooks()
+        /// Who holds the buttons this gesture presses: one tool call, or the human in the mirror.
+        public var owner: InputOwner
+        public init(owner: InputOwner) { self.owner = owner }
+        /// The human in the mirror: no gate, nothing recorded.
+        public static let mirror = Hooks(owner: .mirror)
     }
 
     public struct ClickOutcome {
@@ -106,7 +110,7 @@ public final class InputRouter: Sendable {
     /// step activates the app as far as the system or the user is concerned. Returns nil for
     /// popups and menus, which are left alone.
     @discardableResult
-    public func makeKey(_ t: Target, hooks: Hooks = .none) -> Bool? {
+    public func makeKey(_ t: Target, hooks: Hooks) -> Bool? {
         guard let w = try? windows.resolve(t.windowID), AX.string(w.ax, kAXRoleAttribute) == kAXWindowRole else { return nil }
         // The app is told it is active first: an app that processes "you became active" after
         // the key-window change restores the window that was key before, undoing the change.
@@ -202,25 +206,25 @@ public final class InputRouter: Sendable {
         SemanticPointer.selectText(from: t.point, to: end, pid: t.pid)
     }
 
-    public func mouseDown(_ t: Target, button: MouseButton, clickState: Int, flags: CGEventFlags) throws {
+    public func mouseDown(_ t: Target, button: MouseButton, clickState: Int, flags: CGEventFlags, owner: InputOwner) throws {
         try poster.mouse(button.down, at: t.point, button: button, clickState: clickState, flags: flags, windowID: t.windowID, pid: t.pid)
-        ledger.pressed(button: button, at: t.point, windowID: t.windowID, pid: t.pid)
+        ledger.pressed(button: button, at: t.point, windowID: t.windowID, pid: t.pid, owner: owner)
     }
 
     public func mouseDragged(_ t: Target, button: MouseButton, flags: CGEventFlags) throws {
         try poster.mouse(button.dragged, at: t.point, button: button, clickState: 1, flags: flags, windowID: t.windowID, pid: t.pid)
     }
 
-    public func mouseUp(_ t: Target, button: MouseButton, clickState: Int, flags: CGEventFlags) throws {
+    public func mouseUp(_ t: Target, button: MouseButton, clickState: Int, flags: CGEventFlags, owner: InputOwner) throws {
         try poster.mouse(button.up, at: t.point, button: button, clickState: clickState, flags: flags, windowID: t.windowID, pid: t.pid)
-        ledger.released(button: button, pid: t.pid)
+        ledger.released(button: button, pid: t.pid, owner: owner)
     }
 
     // MARK: Whole gestures
 
     /// A complete click (`count` presses and releases at one point).
     public func click(_ t: Target, button: MouseButton, count: Int, flags: CGEventFlags, element: AXUIElement? = nil,
-                      hooks: Hooks = .none) async throws -> ClickOutcome {
+                      hooks: Hooks) async throws -> ClickOutcome {
         var route = self.route(t, button: button, count: count, flags: flags, element: element)
         if case .element(let el) = route {
             try await hooks.gate()
@@ -254,10 +258,10 @@ public final class InputRouter: Sendable {
         try? await sleepMs(20)
         for i in 1...max(1, count) {
             try await hooks.gate()
-            try mouseDown(t, button: button, clickState: i, flags: flags)
+            try mouseDown(t, button: button, clickState: i, flags: flags, owner: hooks.owner)
             hooks.dispatched(1)
             try? await sleepMs(35)
-            try mouseUp(t, button: button, clickState: i, flags: flags)
+            try mouseUp(t, button: button, clickState: i, flags: flags, owner: hooks.owner)
             hooks.dispatched(1)
             if i < count { try? await sleepMs(40) }
         }
@@ -273,7 +277,7 @@ public final class InputRouter: Sendable {
     /// pointer position it carries, whichever window has the keyboard, so there is nothing to
     /// take from a window the user may be typing in. The app only has to consider itself active.
     public func scroll(_ t: Target, dx: Int32, dy: Int32, repeats: Int = 1, flags: CGEventFlags,
-                       hooks: Hooks = .none, settle: @Sendable () async -> Void) async throws -> ScrollOutcome {
+                       hooks: Hooks, settle: @Sendable () async -> Void) async throws -> ScrollOutcome {
         let vertical = dy != 0
         let delta = vertical ? dy : dx
         let area = ScrollArea.at(pid: t.pid, t.point)

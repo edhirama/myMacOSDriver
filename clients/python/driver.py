@@ -56,7 +56,8 @@ class Driver:
                 return self._round_trip(req, wait)
             except socket.timeout as e:
                 # Waiting longer than the call's own timeout means something is wrong; do not
-                # retry blindly (closing the connection already cancelled the call on the host).
+                # retry blindly. The host cancels the call about 2 s after this connection closes,
+                # unless a retry with the same id attaches first.
                 raise DriverConnectionError(f"no response within {wait:.0f}s for request {req['id']}") from e
             except (ConnectionError, OSError) as e:
                 last_error = e

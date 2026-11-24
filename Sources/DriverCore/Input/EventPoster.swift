@@ -105,15 +105,31 @@ public final class EventPoster: @unchecked Sendable {
     }
 }
 
-/// Tracks every button and key the driver currently holds down, so they can always be released:
-/// on success, error, cancellation, takeover, and shutdown. Nothing is ever left pressed.
+/// Who is holding a button or key down: one tool call, or the human (the mirror window's
+/// forwarder, and actions started from the host UI). Each owner's input is released on its own,
+/// so one call ending, or a takeover, never lets go of something another owner is holding.
+public struct InputOwner: Hashable, Sendable {
+    public let id: String
+    /// The human's input. A takeover releases only scripts' input, never the user's.
+    public let isUser: Bool
+    public init(id: String, isUser: Bool) { self.id = id; self.isUser = isUser }
+
+    /// The human working in the mirror window.
+    public static let mirror = InputOwner(id: "mirror", isUser: true)
+    /// A new owner for one tool call.
+    public static func call(asUser: Bool) -> InputOwner { InputOwner(id: UUID().uuidString, isUser: asUser) }
+}
+
+/// Tracks every button and key currently held down, and by whom, so they can always be
+/// released: on success, error, cancellation, takeover, and shutdown. Nothing is ever left pressed.
 public final class InputLedger: Sendable {
-    struct HeldButton: Hashable { let button: String; let pid: pid_t; let windowID: CGWindowID; let x: Double; let y: Double }
-    struct HeldKey: Hashable { let code: CGKeyCode; let pid: pid_t }
+    struct HeldButton: Hashable { let owner: InputOwner; let button: String; let pid: pid_t; let windowID: CGWindowID; let x: Double; let y: Double }
+    struct HeldKey: Hashable { let owner: InputOwner; let code: CGKeyCode; let pid: pid_t }
     private struct State {
         var buttons: Set<HeldButton> = []
         var keys: [HeldKey] = []
-        var takeoverReleases = 0
+        /// Script owners whose held input a takeover released: their gesture cannot be continued.
+        var interrupted: Set<InputOwner> = []
     }
 
     private let state = Locked(State())
@@ -121,38 +137,51 @@ public final class InputLedger: Sendable {
 
     public init(poster: EventPoster) { self.poster = poster }
 
-    func pressed(button: MouseButton, at p: CGPoint, windowID: CGWindowID, pid: pid_t) {
-        state.withLock { _ = $0.buttons.insert(HeldButton(button: button.rawValue, pid: pid, windowID: windowID, x: p.x, y: p.y)) }
+    func pressed(button: MouseButton, at p: CGPoint, windowID: CGWindowID, pid: pid_t, owner: InputOwner) {
+        state.withLock { _ = $0.buttons.insert(HeldButton(owner: owner, button: button.rawValue, pid: pid, windowID: windowID, x: p.x, y: p.y)) }
     }
-    func released(button: MouseButton, pid: pid_t) {
-        state.withLock { s in s.buttons = s.buttons.filter { !($0.button == button.rawValue && $0.pid == pid) } }
+    func released(button: MouseButton, pid: pid_t, owner: InputOwner) {
+        state.withLock { s in s.buttons = s.buttons.filter { !($0.owner == owner && $0.button == button.rawValue && $0.pid == pid) } }
     }
-    func pressed(key: CGKeyCode, pid: pid_t) { state.withLock { $0.keys.append(HeldKey(code: key, pid: pid)) } }
-    func released(key: CGKeyCode, pid: pid_t) {
-        state.withLock { s in if let i = s.keys.lastIndex(of: HeldKey(code: key, pid: pid)) { s.keys.remove(at: i) } }
+    func pressed(key: CGKeyCode, pid: pid_t, owner: InputOwner) { state.withLock { $0.keys.append(HeldKey(owner: owner, code: key, pid: pid)) } }
+    func released(key: CGKeyCode, pid: pid_t, owner: InputOwner) {
+        state.withLock { s in if let i = s.keys.lastIndex(of: HeldKey(owner: owner, code: key, pid: pid)) { s.keys.remove(at: i) } }
     }
 
     public var heldCount: Int { state.withLock { $0.buttons.count + $0.keys.count } }
 
-    /// How many takeovers found input held and had to release it. A call compares this across
-    /// its gates: if it moved, a gesture the call was holding (a drag) was broken off.
-    public var takeoverReleases: Int { state.withLock { $0.takeoverReleases } }
+    /// True when a takeover released input this owner was holding (a drag in progress), so its
+    /// gesture was broken off and cannot be resumed.
+    public func wasInterrupted(_ owner: InputOwner) -> Bool { state.withLock { $0.interrupted.contains(owner) } }
 
-    /// Releases held input because the user took control.
+    /// Drops what is remembered about an owner whose call has ended.
+    public func forget(_ owner: InputOwner) { state.withLock { _ = $0.interrupted.remove(owner) } }
+
+    /// Releases scripts' held input because the user took control. The user's own input (a drag
+    /// in the mirror) is left alone. Returns how many were released.
     @discardableResult
     public func releaseForTakeover() -> Int {
-        let n = releaseAll()
-        if n > 0 { state.withLock { $0.takeoverReleases += 1 } }
-        return n
+        release { s in
+            let owners = Set(s.buttons.map(\.owner) + s.keys.map(\.owner)).filter { !$0.isUser }
+            s.interrupted.formUnion(owners)
+            return { !$0.isUser }
+        }
     }
 
-    /// Releases everything still held, keys in reverse press order. Returns how many were released.
+    /// Releases what one owner still holds, keys in reverse press order. Returns how many were released.
     @discardableResult
-    public func releaseAll() -> Int {
+    public func releaseAll(owner: InputOwner) -> Int { release { _ in { $0 == owner } } }
+
+    /// Releases everything anyone holds. Only for shutdown.
+    @discardableResult
+    public func releaseEverything() -> Int { release { _ in { _ in true } } }
+
+    private func release(_ select: (inout State) -> (InputOwner) -> Bool) -> Int {
         let (bs, ks) = state.withLock { s in
-            let held = (s.buttons, s.keys)
-            s.buttons = []; s.keys = []
-            return held
+            let match = select(&s)
+            let bs = s.buttons.filter { match($0.owner) }, ks = s.keys.filter { match($0.owner) }
+            s.buttons.subtract(bs); s.keys.removeAll { match($0.owner) }
+            return (bs, ks)
         }
         for b in bs {
             let mb = MouseButton(rawValue: b.button) ?? .left

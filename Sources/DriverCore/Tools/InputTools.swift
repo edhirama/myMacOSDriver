@@ -239,7 +239,7 @@ enum InputTools {
 
             try await ctx.gate()
             try? prepareWindow(d, ctx, pid: hit.pid, windowID: hit.windowID)
-            try d.router.mouseDown(start, button: button, clickState: 1, flags: flags)
+            try d.router.mouseDown(start, button: button, clickState: 1, flags: flags, owner: ctx.inputOwner)
             ctx.dispatched()
             var last = globals[0]
             for p in globals.dropFirst() {
@@ -255,7 +255,7 @@ enum InputTools {
                 }
                 last = p
             }
-            try d.router.mouseUp(InputRouter.Target(pid: hit.pid, windowID: hit.windowID, point: last), button: button, clickState: 1, flags: flags)
+            try d.router.mouseUp(InputRouter.Target(pid: hit.pid, windowID: hit.windowID, point: last), button: button, clickState: 1, flags: flags, owner: ctx.inputOwner)
             ctx.dispatched()
 
             await probe.settle(d, budgetMs: 700)
@@ -368,9 +368,9 @@ enum InputTools {
                     if li < lines.count - 1 {
                         try await ctx.gate()
                         try d.poster.key(0x24, down: true, flags: [], pid: f.pid)
-                        d.inputLedger.pressed(key: 0x24, pid: f.pid)
+                        d.inputLedger.pressed(key: 0x24, pid: f.pid, owner: ctx.inputOwner)
                         try d.poster.key(0x24, down: false, flags: [], pid: f.pid)
-                        d.inputLedger.released(key: 0x24, pid: f.pid)
+                        d.inputLedger.released(key: 0x24, pid: f.pid, owner: ctx.inputOwner)
                         ctx.dispatched(); typed += 1
                         try? await sleepMs(10)
                     }
@@ -416,18 +416,18 @@ enum InputTools {
                     for m in spec.modifiers {
                         flags.insert(m.flag)
                         try d.poster.key(m.keyCode, down: true, flags: flags, pid: f.pid)
-                        d.inputLedger.pressed(key: m.keyCode, pid: f.pid)
+                        d.inputLedger.pressed(key: m.keyCode, pid: f.pid, owner: ctx.inputOwner)
                     }
                     if let code = spec.keyCode {
                         try d.poster.key(code, down: true, flags: flags, pid: f.pid)
-                        d.inputLedger.pressed(key: code, pid: f.pid)
+                        d.inputLedger.pressed(key: code, pid: f.pid, owner: ctx.inputOwner)
                         try d.poster.key(code, down: false, flags: flags, pid: f.pid)
-                        d.inputLedger.released(key: code, pid: f.pid)
+                        d.inputLedger.released(key: code, pid: f.pid, owner: ctx.inputOwner)
                     }
                     for m in spec.modifiers.reversed() {
                         flags.remove(m.flag)
                         try d.poster.key(m.keyCode, down: false, flags: flags, pid: f.pid)
-                        d.inputLedger.released(key: m.keyCode, pid: f.pid)
+                        d.inputLedger.released(key: m.keyCode, pid: f.pid, owner: ctx.inputOwner)
                     }
                     ctx.dispatched(); done += 1
                     try? await sleepMs(15)

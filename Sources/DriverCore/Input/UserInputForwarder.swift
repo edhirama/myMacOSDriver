@@ -53,7 +53,7 @@ public final class UserInputForwarder: Sendable {
         guard enabled, let t = target(at: local) else { return }
         let tgt = InputRouter.Target(pid: t.pid, windowID: t.windowID, point: t.global)
         let count = max(1, clickCount)
-        if count == 1 { router.makeKey(tgt) }
+        if count == 1 { router.makeKey(tgt, hooks: .mirror) }
         state.withLock { $0.keyTarget = (t.pid, t.windowID); $0.semantic = nil }
         switch router.route(tgt, button: button, count: count, flags: flags) {
         case .text(let el):
@@ -70,7 +70,7 @@ public final class UserInputForwarder: Sendable {
         case .element, .events: break
         }
         state.withLock { $0.dragTarget = (tgt, button) }
-        try? router.mouseDown(tgt, button: button, clickState: count, flags: flags)
+        try? router.mouseDown(tgt, button: button, clickState: count, flags: flags, owner: .mirror)
         onFeedback?("\(button.rawValue.capitalized) click → \(t.owner)")
     }
 
@@ -102,7 +102,7 @@ public final class UserInputForwarder: Sendable {
             return
         }
         guard let t else { return }
-        try? router.mouseUp(t.target.at(geo.toGlobal(local)), button: t.button, clickState: max(1, clickCount), flags: flags)
+        try? router.mouseUp(t.target.at(geo.toGlobal(local)), button: t.button, clickState: max(1, clickCount), flags: flags, owner: .mirror)
     }
 
     public func mouseMoved(_ local: CGPoint) {
@@ -119,7 +119,7 @@ public final class UserInputForwarder: Sendable {
         let router = self.router
         // Scrolling does not change which window is key, as with a real mouse.
         Task.detached(priority: .userInitiated) {
-            _ = try? await router.scroll(tgt, dx: dx, dy: dy, flags: flags) { try? await sleepMs(60) }
+            _ = try? await router.scroll(tgt, dx: dx, dy: dy, flags: flags, hooks: .mirror) { try? await sleepMs(60) }
         }
     }
 
@@ -131,12 +131,12 @@ public final class UserInputForwarder: Sendable {
             return
         }
         try? driver.poster.key(code, down: down, flags: flags, pid: t.pid)
-        if down { driver.inputLedger.pressed(key: code, pid: t.pid) } else { driver.inputLedger.released(key: code, pid: t.pid) }
+        if down { driver.inputLedger.pressed(key: code, pid: t.pid, owner: .mirror) } else { driver.inputLedger.released(key: code, pid: t.pid, owner: .mirror) }
     }
 
     /// Called on Give Back: anything the user still holds is released.
     public func reset() {
         state.withLock { $0.keyTarget = nil; $0.dragTarget = nil; $0.semantic = nil }
-        driver.inputLedger.releaseAll()
+        driver.inputLedger.releaseAll(owner: .mirror)
     }
 }

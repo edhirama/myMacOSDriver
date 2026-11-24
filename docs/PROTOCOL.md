@@ -29,7 +29,7 @@ Scripts call tools with one entry point, `driver.call(request)`, and get a JSON 
 Control messages on the same socket:
 
 - `{"op":"cancel","id":"<id>"}` stops a running call at its next safe point.
-- `{"op":"status"}` returns the host state: display, control owner, targets, permissions, arrangement check, in-flight calls and held inputs. It also has `capabilities` (which of the private macOS features this system provides, and what is lost without each) and `interrupted_requests` (requests a previous host process left unfinished).
+- `{"op":"status"}` returns the host state: display, control owner, targets, permissions, arrangement check, in-flight calls and held inputs. It also has `capabilities` (which of the private macOS features this system provides, and what is lost without each; `stage_manager_off` is false while Stage Manager is on, when windows cannot be minimized) and `interrupted_requests` (requests a previous host process left unfinished).
 - `{"op":"tools"}` lists the 11 tools. Each entry has `name`, `description`, `mutating`, `default_timeout_ms` and `input_schema`, a JSON Schema of the arguments generated from the same declarations the host validates against. `driverctl tools` and `Driver().tools()` call it.
 
 ## Response
@@ -105,7 +105,7 @@ Evidence values:
 | `user_has_control` | The user still had control when the call's timeout expired, or took control in the middle of a held gesture such as a drag (`details.resumable: false`). |
 | `target_changed` | A call paused by a takeover found its target changed when control came back: the window closed, or the caret or keyboard focus moved. It did not continue. |
 | `unknown_outcome` | The host stopped while this request was running. It was not run again; observe the state and continue under a new id. |
-| `cancelled` / `timeout` | The call was stopped by `cancel`, by a disconnect, or by its deadline. |
+| `cancelled` / `timeout` | The call was stopped by `cancel`, by a disconnect that no retry followed within 2 s, or by its deadline. |
 | `id_conflict` | The same `id` was reused for a different request. |
 | `accessibility_unavailable` | The AX tree can't be read. `details.fallback` is `computer_screenshot`. |
 | `permission_missing` | Accessibility or Screen Recording isn't granted. |
@@ -164,7 +164,7 @@ On one shop's home page the full snapshot was cut off at 1,500 elements (347 KB)
 | The same `id` already finished | The host returns the stored response with `replayed: true`. |
 | A failure with `dispatch: none` (validation error, `user_has_control` before acting, timeout before acting) | Not stored. Retrying with the same id runs it again, which is safe because nothing happened. |
 | The same `id` with different arguments | `id_conflict`. |
-| A client disconnects | Its in-flight calls are cancelled. A reconnecting client that re-sends the same id gets the stored, possibly `partial`, result. |
+| A client disconnects | Its in-flight calls keep running for 2 s. A client that reconnects and re-sends the same id within that time attaches to the call and gets its real result. If no connection is waiting on the call after 2 s, it is cancelled; a later re-send gets the stored, possibly `partial`, result. |
 | The host restarted after the `id` finished | Same as above: the stored response, `replayed: true`. Calls that can have side effects are journaled to `requests.journal` next to the socket. |
 | The host stopped while the `id` was running | `unknown_outcome` with `dispatch: unknown`. The request is never run a second time, because part of its input may already have been sent. |
 

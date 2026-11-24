@@ -6,9 +6,11 @@ import DriverProtocol
 /// - One JSON object per line in each direction. Responses carry the request `id`, so a client
 ///   may pipeline several requests on one connection.
 /// - `{"op":"cancel","id":...}` cancels a running call; `{"op":"status"}` reports host state.
-/// - When a connection closes, its in-flight calls are cancelled (a departed client should not
-///   keep driving the desktop). Completed results stay in the idempotency ledger, so a client
-///   that reconnects and re-sends the same id gets the stored result instead of a second run.
+/// - When a connection closes, its in-flight calls are cancelled after `disconnectGraceMs` (a
+///   departed client should not keep driving the desktop), unless another connection has sent
+///   the same id by then. So a client whose connection dropped can reconnect, re-send the id and
+///   attach to the call still running, and gets its real result. Completed results stay in the
+///   idempotency ledger, so a later re-send gets the stored result instead of a second run.
 /// - The socket file is created with mode 0600 inside a 0700 directory: only this user can connect.
 public final class SocketServer: @unchecked Sendable {
     public let path: String
@@ -17,6 +19,13 @@ public final class SocketServer: @unchecked Sendable {
     private var acceptSource: DispatchSourceRead?
     private let queue = DispatchQueue(label: "dev.macdriver.ipc", attributes: .concurrent)
     private let connections = Locked<[Int32: Connection]>([:])
+    /// How many open connections are waiting on each in-flight request id.
+    private let waiting = Locked<[String: Int]>([:])
+    /// The latest disconnect that left each id with no client. A grace timer cancels a call only
+    /// if it belongs to that disconnect, so an older timer never cuts a newer grace period short.
+    private let orphans = Locked<(next: Int, latest: [String: Int])>((1, [:]))
+    /// How long a call whose client disconnected keeps running, waiting for a retry to attach.
+    public var disconnectGraceMs = 2_000
     public var onActivity: (@Sendable (String) -> Void)?
     /// Enables `test_take_control` / `test_give_back` for automated tests (`--test-ops`).
     public var testControl: (@Sendable (Bool) -> Void)?
@@ -99,12 +108,44 @@ public final class SocketServer: @unchecked Sendable {
 
     fileprivate func closed(_ c: Connection) {
         connections.withLock { $0[c.fd] = nil }
-        let ids = c.inFlightIDs
-        if !ids.isEmpty {
-            Task { for id in ids { _ = await driver.cancel(id) } }
-            Log.ipc.info("Client disconnected; cancelled \(ids.count) in-flight call(s)")
+        let ids = c.untrackAll()
+        guard !ids.isEmpty else { return }
+        let orphaned = ids.filter { stopWaiting($0) }
+        guard !orphaned.isEmpty else { return }
+        Log.ipc.info("Client disconnected with \(orphaned.count) call(s) in flight; cancelling them unless a retry attaches within \(self.disconnectGraceMs) ms")
+        let grace = disconnectGraceMs
+        let token = orphans.withLock { o -> Int in
+            let t = o.next; o.next += 1
+            for id in orphaned { o.latest[id] = t }
+            return t
+        }
+        Task { [driver] in
+            try? await sleepMs(grace)
+            for id in orphaned where self.claimOrphan(id, token) && !self.isWaitedOn(id) {
+                if await driver.cancel(id) { Log.ipc.info("Cancelled \(id): no client came back for it") }
+            }
         }
     }
+
+    /// True when `token` is still the latest disconnect for the id; the record is then dropped.
+    private func claimOrphan(_ id: String, _ token: Int) -> Bool {
+        orphans.withLock { o in
+            guard o.latest[id] == token else { return false }
+            o.latest[id] = nil
+            return true
+        }
+    }
+
+    private func startWaiting(_ id: String) { waiting.withLock { $0[id, default: 0] += 1 } }
+    /// Returns true when no connection is waiting on the id any more.
+    private func stopWaiting(_ id: String) -> Bool {
+        waiting.withLock { w in
+            let n = (w[id] ?? 1) - 1
+            w[id] = n > 0 ? n : nil
+            return n <= 0
+        }
+    }
+    private func isWaitedOn(_ id: String) -> Bool { waiting.withLock { $0[id] != nil } }
 
     fileprivate func handle(line: Data, from c: Connection) {
         let value: JSONValue
@@ -122,7 +163,7 @@ public final class SocketServer: @unchecked Sendable {
             Task {
                 var s = await driver.status()
                 if case .object(var o) = s { o["connections"] = .number(Double(connectionCount)); s = .object(o) }
-                c.send(["id": JSONValue(id), "ok": true, "op": "status", "result": s])
+                c.sendLater(["id": JSONValue(id), "ok": true, "op": "status", "result": s])
             }
         case .tools(let id):
             c.send(["id": JSONValue(id), "ok": true, "op": "tools",
@@ -141,22 +182,25 @@ public final class SocketServer: @unchecked Sendable {
             }
             Task {
                 let r = await h(o)
-                if let err = r["error"]?.stringValue { c.send(errorEnvelope(id: nil, DriverError(.invalidArgument, err))) }
-                else { c.send(["ok": true, "op": "test_user_input", "result": r]) }
+                if let err = r["error"]?.stringValue { c.sendLater(errorEnvelope(id: nil, DriverError(.invalidArgument, err))) }
+                else { c.sendLater(["ok": true, "op": "test_user_input", "result": r]) }
             }
         case .cancel(let id):
             Task {
                 let found = await driver.cancel(id)
-                c.send(["id": .string(id), "ok": .bool(found), "op": "cancel",
+                c.sendLater(["id": .string(id), "ok": .bool(found), "op": "cancel",
                         "result": ["cancelled": .bool(found)]])
             }
         case .call(let req):
-            c.track(req.id)
+            // A line still in the buffer of a connection that has closed: nobody would receive
+            // the result or be counted as waiting for it, so the call is not started.
+            guard let added = c.track(req.id) else { return }
+            if added { startWaiting(req.id) }
             onActivity?("\(req.name) [\(req.id)]")
             Task {
                 let resp = await driver.call(req)
-                c.untrack(req.id)
-                c.send(resp.json)
+                if c.untrack(req.id) { _ = stopWaiting(req.id) }
+                c.sendLater(resp.json)
             }
         }
     }
@@ -194,15 +238,29 @@ final class Connection: @unchecked Sendable {
     private var source: DispatchSourceRead?
     private var buffer = Data()
     private let writeLock = NSLock()
-    private let ids = Locked<Set<String>>([])
+    /// The ids in flight on this connection; nil once it has closed, so nothing is tracked after.
+    private let ids = Locked<Set<String>?>([])
+    /// Responses produced by tasks are written here, so a slow reader blocks this queue and not
+    /// one of the threads every call shares.
+    private let writeQueue: DispatchQueue
     private var isClosed = false
     static let maxLine = 4 * 1024 * 1024
 
-    init(fd: Int32, server: SocketServer) { self.fd = fd; self.server = server }
+    init(fd: Int32, server: SocketServer) {
+        self.fd = fd; self.server = server
+        writeQueue = DispatchQueue(label: "dev.macdriver.conn.\(fd).write")
+    }
 
-    var inFlightIDs: [String] { Array(ids.get) }
-    func track(_ id: String) { ids.withLock { _ = $0.insert(id) } }
-    func untrack(_ id: String) { ids.withLock { _ = $0.remove(id) } }
+    /// Each says whether it changed anything, so the server counts every id once per connection.
+    /// `track` returns nil when the connection has already closed.
+    func track(_ id: String) -> Bool? { ids.withLock { $0?.insert(id).inserted } }
+    func untrack(_ id: String) -> Bool { ids.withLock { $0?.remove(id) != nil } }
+    /// Called once, when the connection closes: returns what was in flight and stops tracking.
+    func untrackAll() -> [String] { ids.withLock { let all = Array($0 ?? []); $0 = nil; return all } }
+
+    /// `send` from an async task: the write, which may wait for the client, runs on this
+    /// connection's own queue. Responses keep their order.
+    func sendLater(_ v: JSONValue) { writeQueue.async { self.send(v) } }
 
     func start(queue: DispatchQueue) {
         let serial = DispatchQueue(label: "dev.macdriver.conn.\(fd)", target: queue)
@@ -229,21 +287,37 @@ final class Connection: @unchecked Sendable {
         }
     }
 
+    /// How long one response may wait for a client to read before the connection is given up.
+    static let writeTimeoutMs = 2_000
+
+    /// Writes one line. The socket is non-blocking (accepted sockets inherit O_NONBLOCK from the
+    /// listener), so a full buffer waits in `poll` for room, up to `writeTimeoutMs`. A client
+    /// that stops reading for that long is disconnected instead of holding a thread forever.
     func send(_ v: JSONValue) {
         guard var data = try? v.jsonData() else { return }
         data.append(0x0A)
-        writeLock.lock(); defer { writeLock.unlock() }
-        if isClosed { return }
-        data.withUnsafeBytes { raw in
-            var off = 0
-            while off < raw.count {
-                let w = write(fd, raw.baseAddress!.advanced(by: off), raw.count - off)
-                if w < 0 {
-                    if errno == EAGAIN || errno == EINTR { usleep(1000); continue }
-                    return
+        let delivered: Bool = {
+            writeLock.lock(); defer { writeLock.unlock() }
+            if isClosed { return true }
+            let deadline = monotonicMs() + Self.writeTimeoutMs
+            return data.withUnsafeBytes { raw in
+                var off = 0
+                while off < raw.count {
+                    let w = write(fd, raw.baseAddress!.advanced(by: off), raw.count - off)
+                    if w >= 0 { off += w; continue }
+                    if errno == EINTR { continue }
+                    guard errno == EAGAIN else { return false }
+                    let remaining = deadline - monotonicMs()
+                    guard remaining > 0 else { return false }
+                    var p = pollfd(fd: fd, events: Int16(POLLOUT), revents: 0)
+                    if poll(&p, 1, Int32(remaining)) < 0, errno != EINTR { return false }
                 }
-                off += w
+                return true
             }
+        }()
+        if !delivered {
+            Log.ipc.error("Closing a connection whose client stopped reading (or whose socket failed) while a response was sent")
+            close()
         }
     }
 

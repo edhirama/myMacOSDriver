@@ -136,7 +136,7 @@ A stale socket left by a crash is detected (connect fails) and replaced at the n
    1. Wait while the user has control (paused, up to the deadline).
    2. Take the per-target lock, so actions never interleave. A call that pauses later keeps the lock, so queued calls stay in order.
 6. **Gate before every event.** `CallContext.gate()` runs before each individual input event. It throws on cancellation or deadline. If the user has control it *suspends* the call there, and after Give Back runs the call's resume guards before letting it continue.
-7. **Always release.** `InputLedger.releaseAll()` runs on every exit path (success, error, cancel, shutdown) and on takeover, and sends key-up and button-up events for anything still held.
+7. **Always release.** `InputLedger` records who holds each button and key: one call, or the user in the mirror. When a call ends on any path (success, error, cancel), only its own held input is released, with key-up and button-up events. A takeover releases what scripts hold and marks those calls as interrupted, but leaves the user's input alone. Shutdown releases everything.
 8. **Response.** `dispatch` comes from the number of events delivered. `effect` comes from what was observed (below).
 
 **One call, start to finish.** A `computer_click` on a ref, with the user taking control partway through:
@@ -312,6 +312,7 @@ Three things were needed before a browser could be driven, each found by running
 - A paused call that held a button when the user took control is ended, not resumed.
 - The journal protects against the host process dying, not against power loss: records are written but not synced to disk.
 - TextEdit and other document apps autosave: closing an edited, file-backed document saves it without a prompt (`status: closed`, content preserved). Untitled documents with content raise a prompt (`status: prompt_pending`), and the driver never answers it on the caller's behalf.
+- With Stage Manager on, windows do not minimize: the app accepts the request and the window stays where it is, on every display. In the end-to-end run TextEdit also came to the front at that step, which the driver must never cause. `computer_window` then returns `state: normal` with a warning, and `status.capabilities.stage_manager_off` reports `available: false`. The driver does not change the setting; all four end-to-end suites pass with Stage Manager off.
 - Points over system chrome (menu bar, Dock, Control Center) are rejected as `unsupported`, because system UI can't take per-process input.
 - Key codes assume a US/ANSI layout. `computer_type` sends literal Unicode, so typing is layout independent.
 - Newly opened windows appear briefly where the app puts them (usually the main display) before they are moved to the target.

@@ -12,6 +12,8 @@ public final class CallContext: Sendable {
     public let deadlineMs: Int
     /// True for actions the human started from the host UI: they are not subject to the arbiter.
     public let asUser: Bool
+    /// Owns the buttons and keys this call holds down, so only they are released when it ends.
+    public let inputOwner: InputOwner
     let driver: Driver
 
     private struct State {
@@ -22,7 +24,7 @@ public final class CallContext: Sendable {
         var pausedMs = 0
         var pauses = 0
         var paused = false
-        var releaseEpoch = 0
+        var releasedInputs = 0
         /// Each guard captures the state its tool depends on when a pause begins and returns
         /// the check to run when the call resumes.
         var resumeGuards: [@Sendable () -> (@Sendable () throws -> Void)] = []
@@ -31,11 +33,8 @@ public final class CallContext: Sendable {
 
     init(request: ToolRequest, target: Target, mutating: Bool, driver: Driver, deadlineMs: Int, asUser: Bool = false) {
         self.request = request; self.target = target; self.mutating = mutating; self.driver = driver
-        self.deadlineMs = deadlineMs; self.asUser = asUser
+        self.deadlineMs = deadlineMs; self.asUser = asUser; self.inputOwner = .call(asUser: asUser)
     }
-
-    /// Called when the tool body starts, after the target lock is held.
-    func begin() { let e = driver.inputLedger.takeoverReleases; state.withLock { $0.releaseEpoch = e } }
 
     /// Must be called before each input event.
     ///
@@ -66,7 +65,7 @@ public final class CallContext: Sendable {
     }
 
     private func checkGestureIntact() throws {
-        if driver.inputLedger.takeoverReleases != state.withLock({ $0.releaseEpoch }) {
+        if driver.inputLedger.wasInterrupted(inputOwner) {
             throw DriverError(.userHasControl, "The user took control in the middle of a held gesture; the held input was released and the gesture cannot be resumed",
                               details: ["resumable": .bool(false)])
         }
@@ -77,6 +76,10 @@ public final class CallContext: Sendable {
     public func guardResume(_ capture: @escaping @Sendable () -> (@Sendable () throws -> Void)) {
         state.withLock { $0.resumeGuards.append(capture) }
     }
+
+    /// Buttons and keys this call still held when it ended, which the driver released for it.
+    func noteReleased(_ n: Int) { guard n > 0 else { return }; state.withLock { $0.releasedInputs += n } }
+    var releasedInputs: Int { state.withLock { $0.releasedInputs } }
 
     func notePause(_ ms: Int) { guard ms > 0 else { return }; state.withLock { $0.pausedMs += ms; $0.pauses += 1 } }
 
@@ -98,7 +101,7 @@ public final class CallContext: Sendable {
 
     /// This call's view of the router's hooks: pause at the gate, record what happened.
     var hooks: InputRouter.Hooks {
-        var h = InputRouter.Hooks()
+        var h = InputRouter.Hooks(owner: inputOwner)
         h.gate = { [self] in try await self.gate() }
         h.dispatched = { [self] n in self.dispatched(n) }
         h.evidence = { [self] e in self.evidence(e) }
@@ -194,6 +197,7 @@ public final class Driver: @unchecked Sendable {
         let timeout = min(req.timeoutMs ?? spec.defaultTimeoutMs, 600_000)
         let deadline = started + timeout
         var ctx: CallContext?
+        defer { if let ctx { inputLedger.forget(ctx.inputOwner) } }
         do {
             try spec.validate(req.arguments)
             let args = try Args(req.arguments, tool: spec.name, allowed: spec.allowed)
@@ -209,7 +213,8 @@ public final class Driver: @unchecked Sendable {
                                 effect: Effect(confirmed: s.confirmed, evidence: s.evidence),
                                 warnings: s.warnings, durationMs: monotonicMs() - started, pausedMs: c.pause.ms)
         } catch {
-            let held = inputLedger.releaseAll()
+            // Usually the call's own cleanup in `runGuarded` has already released and counted them.
+            let held = ctx.map { c in c.noteReleased(inputLedger.releaseAll(owner: c.inputOwner)); return c.releasedInputs } ?? 0
             var err = mapError(error, deadline: deadline, ctx: ctx)
             if held > 0 { err.details["released_inputs"] = .number(Double(held)) }
             let s = ctx?.snapshot ?? (events: 0, evidence: [], warnings: [], confirmed: false)
@@ -229,7 +234,7 @@ public final class Driver: @unchecked Sendable {
             if arbiter.owner == .user { return try await spec.run(c, args) }
             let l = lock(for: c.target.id)
             try await l.lock()
-            defer { inputLedger.releaseAll(); Task { await l.unlock() } }
+            defer { c.noteReleased(inputLedger.releaseAll(owner: c.inputOwner)); Task { await l.unlock() } }
             return try await spec.run(c, args)
         }
         // Pause before starting while the user has control, then take the target's turn. A call
@@ -237,8 +242,7 @@ public final class Driver: @unchecked Sendable {
         c.notePause(try await arbiter.waitForAgent(deadlineMs: deadline))
         let l = lock(for: c.target.id)
         try await l.lock()
-        defer { inputLedger.releaseAll(); if spec.mutating { router.returnKeyWindowsToUser() }; Task { await l.unlock() } }
-        c.begin()
+        defer { c.noteReleased(inputLedger.releaseAll(owner: c.inputOwner)); router.returnKeyWindowsToUser(); Task { await l.unlock() } }
         return try await spec.run(c, args)
     }
 
@@ -292,7 +296,7 @@ public final class Driver: @unchecked Sendable {
     /// back to a physical display (so nothing is stranded or lost), then release the display.
     public func shutdown() async {
         await ledger.cancelAll()
-        inputLedger.releaseAll()
+        inputLedger.releaseEverything()
         WindowFocuser.withdrawActiveBelief()
         WebAccessibility.withdrawAll()
         if let vid = display.displayID {

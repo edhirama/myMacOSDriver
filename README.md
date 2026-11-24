@@ -106,7 +106,7 @@ scripts/run_tasks.sh
 swift test
 ```
 
-33 unit tests: the ledger and its on-disk journal, the arbiter, tool schemas and argument validation, key parsing, deadlines and protocol parsing. One of them fails if `docs/PROTOCOL.md` stops mentioning a tool or parameter.
+44 unit tests: the ledger and its on-disk journal, the arbiter, tool schemas and argument validation, key parsing, deadlines and protocol parsing. One of them fails if `docs/PROTOCOL.md` stops mentioning a tool or parameter.
 
 The end-to-end suites drive real apps on the virtual monitor through the running host. Start it with test ops enabled first:
 
@@ -120,6 +120,8 @@ open build/MacDriver.app --args --test-ops
 | `python3 Tests/E2E/takeover.py` | 25 | Take Control / Give Back: pausing and resuming a running action, the cases that must not resume, and the user's input through the mirror. |
 | `python3 Tests/E2E/fixture.py` | 25 | The fixture app: standard controls plus two custom-drawn views that only real mouse and key events can reach. Build it first with `scripts/package_fixture.sh`. |
 | `python3 Tests/E2E/recovery.py` | 10 | Kills and relaunches the host, then checks that an interrupted request is not run again and a finished one is replayed. |
+
+Turn Stage Manager off before running them: with it on, windows do not minimize and three checks in `e2e.py` fail (`status` shows it as `capabilities.stage_manager_off`).
 
 `--test-ops` enables socket commands that stand in for the user pressing Take Control / Give Back and acting in the mirror. A host started without it refuses them.
 

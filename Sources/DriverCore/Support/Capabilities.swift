@@ -37,6 +37,15 @@ public enum Capabilities {
     /// HIServices' AX element → CGWindowID lookup.
     public static var axWindowLookup: Bool { MDHasAXWindowLookup() }
 
+    /// Stage Manager is on (System Settings > Desktop & Dock). It is the user's setting: the
+    /// driver only reads it. Seen on macOS 26.2 with it on: windows do not minimize although the
+    /// app accepts the request, and the app asked to minimize can come to the front.
+    public static var stageManagerOn: Bool {
+        let domain = "com.apple.WindowManager" as CFString
+        CFPreferencesAppSynchronize(domain)   // the user can switch it while the host runs
+        return CFPreferencesCopyAppValue("GloballyEnabled" as CFString, domain) as? Bool ?? false
+    }
+
     /// Probed at call time (cheap), plus anything the host registered at runtime.
     public static func all(extra: [Capability] = []) -> [Capability] {
         [
@@ -46,10 +55,13 @@ public enum Capabilities {
             Capability(name: "make_window_key", available: makeKey,
                        purpose: "Makes a window key inside a background app without activating it (SkyLight)",
                        withoutIt: "Mouse events and keystrokes sent to a background app may be ignored; accessibility actions still work"),
-Capability(name: "event_window_stamp", available: EventPoster.canSetWindowLocation,
+            Capability(name: "stage_manager_off", available: !stageManagerOn,
+                       purpose: "With Stage Manager off, windows minimize and restore normally",
+                       withoutIt: "Stage Manager is on: computer_window cannot minimize (the window stays 'normal'), and the app asked to minimize may come to the front on the user's screen. Turn Stage Manager off in Control Center or System Settings > Desktop & Dock"),
+            Capability(name: "event_window_stamp", available: EventPoster.canSetWindowLocation,
                        purpose: "Marks posted mouse events with their position inside the target window (CGEventSetWindowLocation)",
                        withoutIt: "Mouse events reach background apps without a position, so custom views ignore them; accessibility actions still work"),
-                        Capability(name: "ax_window_lookup", available: axWindowLookup,
+            Capability(name: "ax_window_lookup", available: axWindowLookup,
                        purpose: "Maps an accessibility window to its window-server id (_AXUIElementGetWindow)",
                        withoutIt: "Windows are matched by owner and frame instead, which can confuse windows with identical frames"),
         ] + extra

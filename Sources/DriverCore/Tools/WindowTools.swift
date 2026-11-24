@@ -232,7 +232,11 @@ enum WindowTools {
             }
             switch state {
             case "minimized":
-                if !wasMin { try await ctx.gate(); AX.set(w.ax, kAXMinimizedAttribute, kCFBooleanTrue); ctx.dispatched() }
+                if !wasMin {
+                    try await ctx.gate()
+                    let e = AX.set(w.ax, kAXMinimizedAttribute, kCFBooleanTrue); ctx.dispatched()
+                    if e != .success { ctx.warn("Setting AXMinimized returned AX error \(e.rawValue)") }
+                }
             case "maximized":
                 try await unminimize()
                 if let f = AX.frame(w.ax), !ObserveTools.isMaximized(f, display) { d.windows.saveFrame(w.id, f) }
@@ -271,6 +275,12 @@ enum WindowTools {
             let after = AX.frame(w.ax)
             let actual = minimized ? "minimized" : (after.map { ObserveTools.isMaximized($0, display) } == true ? "maximized" : "normal")
             if let s = state, s == actual { ctx.confirm("state_read_back") }
+            else if let s = state {
+                ctx.warn("The window did not reach state '\(s)'; it is '\(actual)'. The app or the system did not carry out the change")
+                if s == "minimized", Capabilities.stageManagerOn {
+                    ctx.warn("Stage Manager is on, and windows do not minimize while it is; see status.capabilities.stage_manager_off")
+                }
+            }
             if let frame, let after, abs(after.minX - geo.toGlobal(frame).minX) <= 2, abs(after.width - frame.width) <= 2,
                abs(after.minY - geo.toGlobal(frame).minY) <= 2, abs(after.height - frame.height) <= 2 {
                 ctx.confirm("frame_read_back")
